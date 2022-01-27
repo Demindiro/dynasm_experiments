@@ -25,6 +25,7 @@
 //! [\`]: https://esolangs.org/wiki/%60
 
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+use std::time::Instant;
 
 pub enum Op {
 	SetV(isize, isize),
@@ -109,6 +110,7 @@ fn run(ops: Vec<Op>) {
 	let mut i = 0;
 	let mut tape = [0; 0x10000];
 	let mut v = 0;
+	let t = Instant::now();
 	unsafe {
 		while let Some(op) = ops.get(i) {
 			i += 1;
@@ -133,6 +135,7 @@ fn run(ops: Vec<Op>) {
 			(a == 0).then(|| print(v));
 		}
 	}
+	eprintln!("{:?}", Instant::now() - t);
 }
 
 fn jit(ops: Vec<Op>) {
@@ -172,7 +175,7 @@ fn jit(ops: Vec<Op>) {
 					; jne =>labels[i - b as usize - 2]
 				);
 			}
-			Op::JmpA(a, b) => {
+			Op::JmpA(_a, _b) => {
 				todo!()
 			}
 		}
@@ -182,21 +185,129 @@ fn jit(ops: Vec<Op>) {
 		; ret
 	);
 	let f = jit.finalize().unwrap();
+	std::fs::write("/tmp/jit.out", &f[..]).unwrap();
 	let f: extern "C" fn(*mut isize) =
 		unsafe { core::mem::transmute(f.ptr(dynasmrt::AssemblyOffset(0))) };
+	let t = Instant::now();
 	f([0; 0x10000].as_mut_ptr());
+	eprintln!("{:?}", Instant::now() - t);
+}
+
+/// JIT with heavier optimization
+///
+/// This JIT actually doesn't generate correct code in all cases but w/e.
+fn jit2(ops: Vec<Op>) {
+	let mut jit = dynasmrt::x64::Assembler::new().unwrap();
+	let labels = core::iter::repeat_with(|| jit.new_dynamic_label())
+		.take(ops.len())
+		.collect::<Box<_>>();
+	dynasm!(jit
+		; push rbx
+		; push rbp
+		; push r15
+		; push r14
+		; push r13
+		; push r12
+		; mov rbx, rdi
+	);
+
+	use dynasmrt::{Register, x64::Rq, x64::X64Relocation, Assembler};
+	let mut tape2reg = std::collections::HashMap::<isize, Rq>::new();
+	let mut reg2tape = std::collections::HashMap::<Rq, isize>::new();
+	let mut regqueue = std::collections::VecDeque::from([Rq::R12, Rq::R13, Rq::R14, Rq::R15, Rq::RBP]);
+
+	let mut load_tape = |t, jit: &mut Assembler<X64Relocation>| {
+		if let Some(r) = tape2reg.get(&t) {
+			return *r;
+		}
+		let r = regqueue.pop_front().unwrap();
+		regqueue.push_back(r);
+		if let Some(i) = reg2tape.remove(&r) {
+			tape2reg.remove(&i).unwrap();
+			dynasm!(jit ; mov [rbx + (i * 8).try_into().unwrap()], Rq(r.code()));
+		}
+		dynasm!(jit ; mov Rq(r.code()), QWORD [rbx + (t * 8).try_into().unwrap()]);
+		tape2reg.insert(t, r);
+		reg2tape.insert(r, t);
+		r
+	};
+	let call_print = |jit: &mut Assembler<X64Relocation>, reg: Rq| {
+		dynasm!(jit
+			; mov rdi, Rq(reg.code())
+			; mov rax, QWORD print as _
+			; call rax
+		);
+	};
+
+	let mut last_reg = None;
+
+	for (i, (op, &lbl)) in ops.into_iter().zip(labels.iter()).enumerate() {
+		match op {
+			Op::SetV(a, b) => {
+				dynasm!(jit ; =>lbl);
+				let r = load_tape(a, &mut jit);
+				if let Ok(b) = i8::try_from(b) {
+					dynasm!(jit ; add Rq(r.code()), BYTE b);
+				} else if let Ok(b) = i32::try_from(b) {
+					dynasm!(jit ; add Rq(r.code()), DWORD b);
+				} else {
+					todo!();
+				}
+				dynasm!(jit ; mov [rbx + (a * 8).try_into().unwrap()], Rq(r.code()));
+				(a == 0).then(|| call_print(&mut jit, r));
+				last_reg = Some(r);
+			}
+			Op::SetA(a, b) => {
+				dynasm!(jit ; =>lbl);
+				let r = load_tape(a, &mut jit);
+				dynasm!(jit ; add Rq(r.code()), [rbx + (b * 8).try_into().unwrap()]);
+				dynasm!(jit ; mov [rbx + (a * 8).try_into().unwrap()], Rq(r.code()));
+				(a == 0).then(|| call_print(&mut jit, r));
+				last_reg = Some(r);
+			}
+			Op::JmpV(a, b) => {
+				let a = load_tape(a, &mut jit);
+				dynasm!(jit
+					; =>lbl
+					; cmp Rq(a.code()), Rq(last_reg.unwrap().code())
+					; jne =>labels[i - b as usize - 2]
+				);
+			}
+			Op::JmpA(_a, _b) => {
+				todo!()
+			}
+		}
+	}
+	dynasm!(jit
+		; pop r12
+		; pop r13
+		; pop r14
+		; pop r15
+		; pop rbp
+		; pop rbx
+		; ret
+	);
+	let f = jit.finalize().unwrap();
+	std::fs::write("/tmp/jit2.out", &f[..]).unwrap();
+	let f: extern "C" fn(*mut isize) =
+		unsafe { core::mem::transmute(f.ptr(dynasmrt::AssemblyOffset(0))) };
+	let t = Instant::now();
+	f([0; 0x10000].as_mut_ptr());
+	eprintln!("{:?}", Instant::now() - t);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+	const USAGE: &str = "usage: <interpreter|jit|jit2> <file>";
 	let mut args = std::env::args().skip(1);
-	let mode = args.next().ok_or("usage: <interpreter|jit> <file>")?;
-	let f = args.next().ok_or("usage: <interpreter|jit> <file>")?;
+	let mode = args.next().ok_or(USAGE)?;
+	let f = args.next().ok_or(USAGE)?;
 	let f = std::fs::read(f)?;
 	let f = parse(f);
 	match &*mode {
 		"interpreter" => run(f),
 		"jit" => jit(f),
-		_ => Err("usage: <interpreter|jit> <file>")?,
+		"jit2" => jit2(f),
+		_ => Err(USAGE)?,
 	}
 	Ok(())
 }
